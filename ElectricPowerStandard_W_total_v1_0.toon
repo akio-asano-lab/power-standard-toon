@@ -1,0 +1,174 @@
+root: ElectricPowerStandard_W_total_v1_0
+  meta:
+    name: "Electric Power Standard W_total Model"
+    version: "1.0.0"
+    author: "YOUR_NAME_HERE"
+    language: "ja"
+    description: "E0（非電力満足度）と W_power（電力構造健全度）から W_total（エネルギー生活総合スコア）を求める計算モデル。"
+
+  # --------------------------------------------------
+  # スケール定義
+  # --------------------------------------------------
+  scale:
+    E0: "0..100   # 非電力側の満足度"
+    W_power: "0..100   # 電力構造健全度"
+    W_total: "0..100   # 総合エネルギー生活健全度"
+    E1: "0..100   # 電力ELS（電力満足度）"
+    Swater_energy: "0..100"
+    Sfuel_energy: "0..100"
+    Swater_service: "0..100"
+    Sfuel_service: "0..100"
+
+  # --------------------------------------------------
+  # 入力パラメータ／生データ
+  # --------------------------------------------------
+  inputs:
+    # 物理・構造側（客観指標）
+    GEP:        "float  # 国家正味発電量 (>0)"
+    GEP_ref:    "float  # GEP の基準値（参照値, >0）"
+    EPC:        "float  # 一人当たり消費電力 (>0)"
+    EPC_ref:    "float  # EPC の基準値（許容上限イメージ, >0）"
+    R:          "float  # 電力自立度 (GEP / C_dom)"
+    I:          "float  # CO₂原単位 (CO2 / GEP)"
+    I_max:      "float  # CO₂原単位の許容上限"
+
+    # 満足度（主観ゾーン）
+    E1:               "float  # 電力ELS（電力満足度, 0..100）"
+    Swater_energy:    "float  # 水インフラの『エネルギーとしての満足度』0..100"
+    Sfuel_energy:     "float  # 燃料インフラの『エネルギーとしての満足度』0..100"
+    Swater_service:   "float  # 水インフラの『サービスとしての満足度』0..100"
+    Sfuel_service:    "float  # 燃料インフラの『サービスとしての満足度』0..100"
+
+    # 重み（0..1）
+    wG:   "float  # GEPスコアの重み"
+    wR:   "float  # Rスコアの重み"
+    wI:   "float  # Iスコアの重み"
+    wEpc: "float  # EPCスコアの重み"
+    wL:   "float  # E1スコアの重み"
+    wE0:  "float  # E0_energy の重み（E0内）"
+    wS:   "float  # E0_service の重み（E0内）; wE0 + wS = 1"
+    w0:   "float  # W_total合成時の非電力側の重み"
+    w1:   "float  # W_total合成時の電力側の重み; w0 + w1 = 1"
+
+    # ペナルティ関連（スカラー, 0..100を想定）
+    penalty_R_max:    "float  # R が長期に低い場合の最大ペナルティ候補"
+    penalty_I_max:    "float  # I が大きく逸脱する場合の最大ペナルティ候補"
+    penalty_ELS_max:  "float  # E1 が下限を割る場合の最大ペナルティ候補"
+    penalty_loc_max:  "float  # 局所ELSが悪い場合の最大ペナルティ候補"
+    E1_min:           "float  # 電力ELSの下限（尊厳ライン, 0..100）"
+    local_ratio_bad:  "float  # 局所ELSが悪化している人口比率など (0..1)"
+
+  # --------------------------------------------------
+  # ユーティリティ関数（擬似コード風表現）
+  # --------------------------------------------------
+  functions:
+    clip_0_100: "x -> min(100, max(0, x))"
+    abs:        "標準的な絶対値関数 abs(x)"
+
+  # --------------------------------------------------
+  # 1. 非電力側スコア E0 の計算
+  # --------------------------------------------------
+  E0_block:
+    E0_energy:  "E0_energy  = (Swater_energy + Sfuel_energy) / 2"
+    E0_service: "E0_service = (Swater_service + Sfuel_service) / 2"
+    E0_final:   "E0 = wE0 * E0_energy + wS * E0_service   # 前提: wE0 + wS = 1"
+
+  # --------------------------------------------------
+  # 2. 正規化スコア（電力側）の計算
+  # --------------------------------------------------
+  normalized_scores:
+    SGEP: "SGEP = min(1, GEP / GEP_ref)"
+
+    SR: |
+      SR = 
+        if R < 1 then R
+        else 1
+
+    SI: |
+      SI = 
+        if I <= I_max then 1
+        else max(0, I_max / I)
+
+    SEPC: |
+      SEPC =
+        if EPC <= EPC_ref then 1
+        else EPC_ref / EPC
+
+    SE1: "SE1 = E1 / 100.0"
+
+  # --------------------------------------------------
+  # 3. ペナルティ P の定義（推奨形・実装側で調整可）
+  # --------------------------------------------------
+  penalties:
+    # R が 1 より十分低い状態が続く場合のペナルティ（簡易版）
+    P_R: |
+      # ここでは静学簡易形として:
+      #   R < 0.7 のとき線形に penalty_R_max まで増加
+      P_R =
+        if R >= 1      then 0
+        else if R >= 0.7 then penalty_R_max * (1 - R) / (1 - 0.7)
+        else penalty_R_max
+
+    # I が I_max を大きく超える場合のペナルティ（簡易版）
+    P_I: |
+      # I <= I_max なら 0、I が 2 * I_max を超えると penalty_I_max まで増加
+      P_I =
+        if I <= I_max then 0
+        else if I >= 2 * I_max then penalty_I_max
+        else penalty_I_max * (I - I_max) / I_max
+
+    # E1 が E1_min を割り込む場合のペナルティ（簡易版）
+    P_ELS: |
+      # E1 >= E1_min なら 0、E1 = 0 で penalty_ELS_max
+      P_ELS =
+        if E1 >= E1_min then 0
+        else penalty_ELS_max * (E1_min - E1) / E1_min
+
+    # 局所ELS悪化のペナルティ（人口比率 local_ratio_bad に応じて）
+    P_local: |
+      # local_ratio_bad が 0..1 の範囲で悪化の広がりを表すと仮定
+      P_local = penalty_loc_max * local_ratio_bad
+
+    # 総ペナルティ
+    P_total: "P = P_R + P_I + P_ELS + P_local   # 想定レンジ 0..100"
+
+  # --------------------------------------------------
+  # 4. 電力構造健全度 W_power の計算
+  # --------------------------------------------------
+  W_power_block:
+    # 正規化スコアの重み付き平均（0..1スケール）
+    W_power_norm: |
+      W_power_norm =
+        (wG * SGEP +
+         wR * SR   +
+         wI * SI   +
+         wEpc * SEPC +
+         wL * SE1) /
+        (wG + wR + wI + wEpc + wL)
+
+    # 0..100 にスケーリングし、ペナルティを差し引き、0..100にクリップ
+    W_power_raw:   "W_power_raw = W_power_norm * 100.0"
+    W_power_final: "W_power = clip_0_100(W_power_raw - P)"
+
+  # --------------------------------------------------
+  # 5. 非電力＋電力の合成（W_total）
+  # --------------------------------------------------
+  W_total_block:
+    # 5-1. 単純加重平均（素点）
+    Base: "Base = w0 * E0 + w1 * W_power   # 前提: w0 + w1 = 1"
+
+    # 5-2. ギャップ（不調和）の測定
+    Mismatch: "Mismatch = abs(E0 - W_power)   # 0..100"
+
+    # 5-3. ハーモニーペナルティ（非電力/電力の混ざり具合 + ギャップ）
+    Harmony_penalty: |
+      # w0 = 1, w1 = 0（非電力のみ）→ 0
+      # w0 = 0, w1 = 1（電力のみ）  → 0
+      # w0 = w1 = 0.5（半々）       → 最大
+      Harmony_penalty = 4.0 * w0 * w1 * (Mismatch / 100.0)
+
+    Harmony_factor: "Harmony_factor = 1.0 - Harmony_penalty"
+
+    # 5-4. 最終スコア W_total
+    W_total_raw: "W_total_raw = Base * Harmony_factor"
+    W_total:     "W_total = clip_0_100(W_total_raw)"
